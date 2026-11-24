@@ -343,6 +343,12 @@ async fn launch_instance(
             let is_modern_neoforge = neo_target_ver.starts_with("20.") || neo_target_ver.starts_with("21.") || neo_target_ver.starts_with("22.");
 
             if is_modern_neoforge {
+                // NeoForge installer requires launcher_profiles.json to exist in the target directory
+                let profiles_json_path = state.data_dir.join("launcher_profiles.json");
+                if !profiles_json_path.exists() {
+                    let _ = std::fs::write(&profiles_json_path, b"{\"profiles\":{}}");
+                }
+
                 // Run headless installer if patched client jar or version.json doesn't exist yet
                 if !patched_client_path.is_file() || !neoforge_version_json_path.is_file() {
                     let _ = emitter_loader.emit(
