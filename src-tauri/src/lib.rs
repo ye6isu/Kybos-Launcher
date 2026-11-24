@@ -314,7 +314,7 @@ async fn launch_instance(
         }
         ModLoader::NeoForge | ModLoader::Forge => {
             let emitter_loader = app_handle.clone();
-            let (neo_main, neo_libs, installer_jar, neo_game_args) = downloader
+            let (neo_main, neo_libs, installer_jar, neo_game_args, neo_target_ver) = downloader
                 .download_neoforge_loader(&instance.game_version, &libraries_dir, |status, percentage| {
                     let _ = emitter_loader.emit(
                         "game-install-progress",
@@ -326,17 +326,134 @@ async fn launch_instance(
                     );
                 })
                 .await?;
-            main_class = neo_main;
-            extra_game_args = neo_game_args;
 
-            // ForgeWrapper system properties
-            extra_jvm_args.push(format!("-Dforgewrapper.librariesDir={}", libraries_dir.display()));
-            extra_jvm_args.push(format!("-Dforgewrapper.installer={}", installer_jar.display()));
-            extra_jvm_args.push(format!("-Dforgewrapper.minecraft={}", client_jar.display()));
+            // 1. Check if modern NeoForge (20.3+ / 21+) using cpw.mods.bootstraplauncher.BootstrapLauncher
+            let patched_client_rel = format!(
+                "net/neoforged/neoforge/{0}/neoforge-{0}-client.jar",
+                neo_target_ver
+            );
+            let patched_client_path = libraries_dir.join(&patched_client_rel);
 
-            for lib in neo_libs {
-                if !libraries.contains(&lib) {
-                    libraries.push(lib);
+            let neoforge_version_json_path = state
+                .data_dir
+                .join("versions")
+                .join(format!("neoforge-{}", neo_target_ver))
+                .join(format!("neoforge-{}.json", neo_target_ver));
+
+            let is_modern_neoforge = neo_target_ver.starts_with("20.") || neo_target_ver.starts_with("21.") || neo_target_ver.starts_with("22.");
+
+            if is_modern_neoforge {
+                // Run headless installer if patched client jar or version.json doesn't exist yet
+                if !patched_client_path.is_file() || !neoforge_version_json_path.is_file() {
+                    let _ = emitter_loader.emit(
+                        "game-install-progress",
+                        serde_json::json!({
+                            "title": "Configuring NeoForge Client",
+                            "status": "Running headless NeoForge patcher (this may take a minute)...",
+                            "percentage": 50.0
+                        }),
+                    );
+
+                    let install_status = std::process::Command::new(&java_path)
+                        .arg("-jar")
+                        .arg(&installer_jar)
+                        .arg("--installClient")
+                        .arg(&state.data_dir)
+                        .status()
+                        .map_err(|e| format!("Failed to run NeoForge installer: {}", e))?;
+
+                    if !install_status.success() {
+                        return Err("NeoForge client patcher failed to run successfully.".to_string());
+                    }
+                }
+
+                // If version json exists, parse JVM args, Game args, and libraries directly
+                if neoforge_version_json_path.is_file() {
+                    if let Ok(vjson_content) = std::fs::read_to_string(&neoforge_version_json_path) {
+                        if let Ok(vjson) = serde_json::from_str::<serde_json::Value>(&vjson_content) {
+                            if let Some(mc) = vjson.get("mainClass").and_then(|s| s.as_str()) {
+                                main_class = mc.to_string();
+                            }
+
+                            // Read JVM args from version.json
+                            if let Some(jvm_array) = vjson.get("arguments").and_then(|a| a.get("jvm")).and_then(|j| j.as_array()) {
+                                for item in jvm_array {
+                                    if let Some(s) = item.as_str() {
+                                        // Replace ${library_directory}, ${version_name}, ${classpath_separator}
+                                        #[cfg(target_os = "windows")]
+                                        let cp_sep = ";";
+                                        #[cfg(not(target_os = "windows"))]
+                                        let cp_sep = ":";
+
+                                        let lib_dir_str = libraries_dir.to_string_lossy().to_string();
+                                        let replaced = s
+                                            .replace("${library_directory}", &lib_dir_str)
+                                            .replace("${version_name}", &instance.game_version)
+                                            .replace("${classpath_separator}", cp_sep);
+                                        extra_jvm_args.push(replaced);
+                                    }
+                                }
+                            }
+
+                            // Read game args from version.json
+                            if let Some(game_array) = vjson.get("arguments").and_then(|a| a.get("game")).and_then(|g| g.as_array()) {
+                                for item in game_array {
+                                    if let Some(s) = item.as_str() {
+                                        extra_game_args.push(s.to_string());
+                                    }
+                                }
+                            }
+
+                            // Read required runtime libraries from version.json
+                            if let Some(libs_array) = vjson.get("libraries").and_then(|l| l.as_array()) {
+                                for lib_item in libs_array {
+                                    if let Some(p) = lib_item.get("downloads").and_then(|d| d.get("artifact")).and_then(|a| a.get("path")).and_then(|p| p.as_str()) {
+                                        let full_p = libraries_dir.join(p);
+                                        if !libraries.contains(&full_p) {
+                                            libraries.push(full_p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Add patched client to libraries
+                if patched_client_path.is_file() && !libraries.contains(&patched_client_path) {
+                    libraries.push(patched_client_path);
+                }
+
+                // Filter out module libraries that are already on -p or conflicts from classpath
+                // Notice: bootstraplauncher, securejarhandler, asm 9.10.1, JarJarFileSystems are loaded on -p
+                // Notice: old asm-9.3 and gson-2.8.9 should not be loaded on cp to avoid runtime NoSuchMethodErrors
+                libraries.retain(|lib| {
+                    let s = lib.to_string_lossy().to_lowercase();
+                    !s.contains("bootstraplauncher-") &&
+                    !s.contains("securejarhandler-") &&
+                    !s.contains("jarjarfilesystems-") &&
+                    !s.contains("asm-9.3") &&
+                    !s.contains("asm-commons-9.3") &&
+                    !s.contains("asm-tree-9.3") &&
+                    !s.contains("asm-analysis-9.3") &&
+                    !s.contains("gson-2.8.9") &&
+                    !s.contains("neoforge-") && // client/universal is loaded as module
+                    !s.contains("client-1.21") // srg/slim/extra
+                });
+
+            } else {
+                // Legacy Forge / ForgeWrapper
+                main_class = neo_main;
+                extra_game_args = neo_game_args;
+
+                extra_jvm_args.push(format!("-Dforgewrapper.librariesDir={}", libraries_dir.display()));
+                extra_jvm_args.push(format!("-Dforgewrapper.installer={}", installer_jar.display()));
+                extra_jvm_args.push(format!("-Dforgewrapper.minecraft={}", client_jar.display()));
+
+                for lib in neo_libs {
+                    if !libraries.contains(&lib) {
+                        libraries.push(lib);
+                    }
                 }
             }
         }

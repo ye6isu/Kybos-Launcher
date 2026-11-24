@@ -112,14 +112,16 @@ impl JavaProvisioner {
             }
         }
 
-        // 3. Check system java
+        // 3. Check system java (ONLY accept if version >= 21)
         let system_bin = PathBuf::from("java");
         if let Ok(v) = self.detect_version(&system_bin) {
-            return Some(JavaRuntimeInfo {
-                path: system_bin,
-                major_version: v,
-                is_valid_for_modern_mc: v >= 21,
-            });
+            if v >= 21 {
+                return Some(JavaRuntimeInfo {
+                    path: system_bin,
+                    major_version: v,
+                    is_valid_for_modern_mc: true,
+                });
+            }
         }
 
         None

@@ -462,7 +462,7 @@ impl MinecraftDownloader {
         game_version: &str,
         libraries_dir: &Path,
         mut on_progress: F,
-    ) -> Result<(String, Vec<PathBuf>, PathBuf, Vec<String>), String>
+    ) -> Result<(String, Vec<PathBuf>, PathBuf, Vec<String>, String), String>
     where
         F: FnMut(&str, f64),
     {
@@ -673,6 +673,6 @@ impl MinecraftDownloader {
         }
 
         on_progress("NeoForge loader ready.", 100.0);
-        Ok((profile.main_class, paths, installer_path, game_args))
+        Ok((profile.main_class, paths, installer_path, game_args, target_version.to_string()))
     }
 }
