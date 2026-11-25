@@ -174,6 +174,40 @@ impl InstanceManager {
     }
 
     /// Cross-platform folder opener: Windows (`explorer`), macOS (`open`), Linux (`xdg-open`).
+    pub fn open_instance_directory(&self, instance_id: &str) -> Result<(), String> {
+        let inst_dir = self.instance_path(instance_id);
+        if !inst_dir.exists() {
+            fs::create_dir_all(&inst_dir).map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+                .arg(&inst_dir)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg(&inst_dir)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&inst_dir)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    /// Cross-platform folder opener: Windows (`explorer`), macOS (`open`), Linux (`xdg-open`).
     pub fn open_mods_folder(&self, instance_id: &str) -> Result<(), String> {
         let mods_dir = self.instance_path(instance_id).join("mods");
         if !mods_dir.exists() {

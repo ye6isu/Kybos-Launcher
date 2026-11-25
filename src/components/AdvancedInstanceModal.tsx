@@ -346,6 +346,16 @@ export const AdvancedInstanceModal: React.FC<AdvancedInstanceModalProps> = ({
     }
   };
 
+  // Open full instance directory / file explorer
+  const handleOpenInstanceDirectory = async () => {
+    if (!form.id) return;
+    try {
+      await invoke('open_instance_directory', { instanceId: form.id });
+    } catch (err) {
+      showToast(`Could not open directory: ${err}`);
+    }
+  };
+
   // File Picker to add mod directly
   const handlePickModFiles = async () => {
     if (!form.id) {
@@ -921,25 +931,6 @@ export const AdvancedInstanceModal: React.FC<AdvancedInstanceModalProps> = ({
                   </div>
                 )}
               </div>
-
-              {/* Dangerous Zone */}
-              {isEditing && onDeleteInstance && (
-                <div className="p-6 rounded-3xl border border-rose-500/20 bg-rose-500/[0.03] flex items-center justify-between">
-                  <div>
-                    <h4 className="text-xs font-semibold text-rose-400">Delete Instance</h4>
-                    <p className="text-[11px] text-rose-400/60 mt-0.5">Permanently deletes configuration, saves and installed mods.</p>
-                  </div>
-                  <button
-                    onClick={() => {
-                      onClose();
-                      onDeleteInstance(form.id);
-                    }}
-                    className="px-4 py-2 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-xs font-medium transition-all cursor-pointer"
-                  >
-                    Delete Instance
-                  </button>
-                </div>
-              )}
             </div>
           </div>
         )}
@@ -1183,13 +1174,40 @@ export const AdvancedInstanceModal: React.FC<AdvancedInstanceModalProps> = ({
         {/* Bottom Action Footer */}
         <div className="h-16 px-6 border-t border-white/[0.07] flex items-center justify-between shrink-0 bg-[#0C0C0C]/80">
           <div className="flex items-center gap-2">
+            {isEditing && (
+              <button
+                type="button"
+                onClick={handleOpenInstanceDirectory}
+                className="px-3.5 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/15 text-white/70 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+                title="Open Instance Directory in File Explorer"
+              >
+                <FolderOpen className="size-3.5" />
+                <span>Open Folder</span>
+              </button>
+            )}
+
             {isEditing && onShareInstance && (
               <button
+                type="button"
                 onClick={() => onShareInstance(editingInstance)}
                 className="px-3.5 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/15 text-white/70 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
               >
                 <Share2 className="size-3.5" />
                 <span>Share Code</span>
+              </button>
+            )}
+
+            {isEditing && onDeleteInstance && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onDeleteInstance(form.id);
+                }}
+                className="px-3 py-1.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 hover:text-rose-300 border border-rose-500/20 text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+              >
+                <Trash2 className="size-3.5" />
+                <span>Delete</span>
               </button>
             )}
           </div>

@@ -20,6 +20,8 @@ use launcher::MinecraftLauncher;
 use mod_share::ShareManifest;
 use modrinth::{ModVersion, ModrinthClient};
 use ms_auth::{DeviceCodeResponse, MicrosoftAuth};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
@@ -28,6 +30,7 @@ pub struct AppState {
     pub instances_dir: PathBuf,
     pub data_dir: PathBuf,
     pub account_store: Mutex<AccountStore>,
+    pub running_processes: Mutex<HashMap<String, u32>>,
 }
 
 // ---------------- Accounts Commands ----------------
@@ -213,12 +216,80 @@ fn toggle_instance_mod(
 }
 
 #[tauri::command]
+fn open_instance_directory(
+    instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let manager = InstanceManager::new(state.instances_dir.clone());
+    manager.open_instance_directory(&instance_id)
+}
+
+#[tauri::command]
 fn open_instance_mods_folder(
     instance_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let manager = InstanceManager::new(state.instances_dir.clone());
     manager.open_mods_folder(&instance_id)
+}
+
+#[tauri::command]
+fn get_running_instances(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let map = state.running_processes.lock().unwrap();
+    Ok(map.keys().cloned().collect())
+}
+
+#[tauri::command]
+fn get_instance_logs(
+    instance_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let manager = InstanceManager::new(state.instances_dir.clone());
+    let inst_dir = manager.instance_path(&instance_id);
+
+    // 1. Check crash reports first
+    let crash_dir = inst_dir.join("crash-reports");
+    if crash_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&crash_dir) {
+            let mut crash_files: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .collect();
+            crash_files.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+            if let Some(latest_crash) = crash_files.last() {
+                if let Ok(content) = std::fs::read_to_string(latest_crash.path()) {
+                    return Ok(format!(
+                        "=== CRASH REPORT ({}) ===\n\n{}",
+                        latest_crash.file_name().to_string_lossy(),
+                        content
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. Check logs/latest.log
+    let latest_log = inst_dir.join("logs").join("latest.log");
+    if latest_log.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&latest_log) {
+            // Return last 300 lines if too large
+            let lines: Vec<&str> = content.lines().collect();
+            let start = if lines.len() > 300 { lines.len() - 300 } else { 0 };
+            return Ok(lines[start..].join("\n"));
+        }
+    }
+
+    // 3. Check logs/debug.log
+    let debug_log = inst_dir.join("logs").join("debug.log");
+    if debug_log.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&debug_log) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = if lines.len() > 300 { lines.len() - 300 } else { 0 };
+            return Ok(lines[start..].join("\n"));
+        }
+    }
+
+    Ok("No game logs or crash reports found yet for this instance.".to_string())
 }
 
 // ---------------- Launch Command ----------------
@@ -234,6 +305,14 @@ async fn launch_instance(
         .into_iter()
         .find(|i| i.id == instance_id)
         .ok_or_else(|| "Instance not found".to_string())?;
+
+    // Check if instance is already running
+    {
+        let running = state.running_processes.lock().unwrap();
+        if running.contains_key(&instance_id) {
+            return Err("This instance is already running.".to_string());
+        }
+    }
 
     let instance_dir = manager.instance_path(&instance_id);
 
@@ -482,7 +561,7 @@ async fn launch_instance(
         .await?;
 
     // 5. Launch Minecraft Process
-    let child = MinecraftLauncher::launch(
+    let mut child = MinecraftLauncher::launch(
         &java_path,
         &instance,
         &instance_dir,
@@ -496,7 +575,104 @@ async fn launch_instance(
         &extra_game_args,
     )?;
 
-    Ok(format!("Minecraft started with PID {}", child.id()))
+    let pid = child.id();
+    let instance_id_clone = instance_id.clone();
+    let inst_name_clone = instance.name.clone();
+
+    // Store PID in running_processes
+    {
+        let mut running = state.running_processes.lock().unwrap();
+        running.insert(instance_id.clone(), pid);
+    }
+
+    // Emit event that instance has started running
+    let _ = app_handle.emit("instance-started", serde_json::json!({
+        "instanceId": instance_id.clone(),
+        "instanceName": inst_name_clone,
+        "pid": pid,
+    }));
+
+    // Spawn monitoring thread to capture stdout/stderr to disk and detect crashes/exit
+    let app_handle_monitor = app_handle.clone();
+    let inst_dir_monitor = instance_dir.clone();
+    let stdout_opt = child.stdout.take();
+    let stderr_opt = child.stderr.take();
+
+    std::thread::spawn(move || {
+        let logs_dir = inst_dir_monitor.join("logs");
+        std::fs::create_dir_all(&logs_dir).ok();
+        let log_file_path = logs_dir.join("latest.log");
+        let _ = std::fs::File::create(&log_file_path);
+
+        // Spawn a thread to read stdout
+        if let Some(stdout) = stdout_opt {
+            let log_file_ref = log_file_path.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file_ref) {
+                    use std::io::Write;
+                    for line in reader.lines().flatten() {
+                        let _ = writeln!(file, "{}", line);
+                    }
+                }
+            });
+        }
+
+        // Spawn a thread to read stderr
+        if let Some(stderr) = stderr_opt {
+            let log_file_ref = log_file_path.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file_ref) {
+                    use std::io::Write;
+                    for line in reader.lines().flatten() {
+                        let _ = writeln!(file, "[STDERR] {}", line);
+                    }
+                }
+            });
+        }
+
+        let exit_status = child.wait();
+        let exit_code = match exit_status {
+            Ok(status) => status.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+
+        // Remove from running processes in state
+        if let Some(state_ref) = app_handle_monitor.try_state::<AppState>() {
+            let mut running = state_ref.running_processes.lock().unwrap();
+            running.remove(&instance_id_clone);
+        }
+
+        let is_crash = exit_code != 0;
+
+        // Check if there are crash reports in crash-reports/
+        let mut crash_file_content: Option<String> = None;
+        let crash_dir = inst_dir_monitor.join("crash-reports");
+        if crash_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&crash_dir) {
+                let mut crashes: Vec<_> = entries
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .collect();
+                crashes.sort_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+                if let Some(latest) = crashes.last() {
+                    crash_file_content = std::fs::read_to_string(latest.path()).ok();
+                }
+            }
+        }
+
+        // Emit instance stopped/crashed event to frontend
+        let _ = app_handle_monitor.emit("instance-stopped", serde_json::json!({
+            "instanceId": instance_id_clone,
+            "instanceName": inst_name_clone,
+            "exitCode": exit_code,
+            "isCrash": is_crash,
+            "crashReport": crash_file_content,
+        }));
+    });
+
+    Ok(format!("Minecraft started with PID {}", pid))
 }
 #[tauri::command]
 fn export_instance_share_code(
@@ -938,6 +1114,7 @@ pub fn run() {
                 instances_dir,
                 data_dir: app_data,
                 account_store: Mutex::new(account_store),
+                running_processes: Mutex::new(HashMap::new()),
             });
 
             Ok(())
@@ -953,7 +1130,10 @@ pub fn run() {
             delete_instance,
             list_instance_mods,
             toggle_instance_mod,
+            open_instance_directory,
             open_instance_mods_folder,
+            get_running_instances,
+            get_instance_logs,
             export_instance_share_code,
             parse_share_code,
             resolve_mod_from_hash,

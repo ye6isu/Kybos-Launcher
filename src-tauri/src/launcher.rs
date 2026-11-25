@@ -2,6 +2,8 @@ use crate::accounts::Account;
 use crate::instances::InstanceConfig;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 pub struct MinecraftLauncher;
 
@@ -21,6 +23,10 @@ impl MinecraftLauncher {
         extra_game_args: &[String],
     ) -> Result<Child, String> {
         let mut cmd = Command::new(java_bin);
+
+        // Hide command prompt window on Windows (CREATE_NO_WINDOW = 0x08000000)
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(0x08000000);
 
         // 1. RAM Allocation arguments (-Xms, -Xmx)
         cmd.arg(format!("-Xms{}M", instance.ram_mb / 2));
@@ -81,8 +87,9 @@ impl MinecraftLauncher {
         // Working directory inside instance root
         cmd.current_dir(instance_dir);
 
-        cmd.stdout(Stdio::inherit())
-           .stderr(Stdio::inherit());
+        // Pipe stdout and stderr so launcher can monitor logs in background without opening console windows
+        cmd.stdout(Stdio::piped())
+           .stderr(Stdio::piped());
 
         cmd.spawn().map_err(|e| format!("Failed to spawn Minecraft process: {}", e))
     }

@@ -26,7 +26,10 @@ import {
   Loader2,
   Package,
   Sparkles,
-  KeyRound
+  KeyRound,
+  FileText,
+  AlertTriangle,
+  RotateCcw
 } from 'lucide-react';
 import { SkinPreview3D } from './components/SkinPreview3D';
 import { SkinAvatar } from './components/SkinAvatar';
@@ -160,6 +163,20 @@ export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [launchingInstanceId, setLaunchingInstanceId] = useState<string | null>(null);
+  const [runningInstances, setRunningInstances] = useState<string[]>([]);
+  const [logModal, setLogModal] = useState<{
+    open: boolean;
+    instanceName: string;
+    instanceId: string;
+    logs: string;
+    isCrash?: boolean;
+    exitCode?: number;
+  }>({
+    open: false,
+    instanceName: '',
+    instanceId: '',
+    logs: '',
+  });
   const [installProgress, setInstallProgress] = useState<{
     title: string;
     status: string;
@@ -245,9 +262,13 @@ export function App() {
       }));
       setUnsplashAccessKey(unsplashConf?.access_key || '');
       setUnsplashTopics(unsplashConf?.topics || 'architecture,nature,wallpapers');
+      const running = await invoke<string[]>('get_running_instances').catch(() => []);
+      setRunningInstances(running);
       setIsLoaded(true);
     } catch (e) {
       console.error('Failed to load data:', e);
+      const running = await invoke<string[]>('get_running_instances').catch(() => []);
+      setRunningInstances(running);
       setIsLoaded(true);
     }
   };
@@ -267,8 +288,40 @@ export function App() {
       }
     });
 
+    // Listen for instance started and stopped events
+    const unlistenStarted = listen<{ instanceId: string; instanceName: string; pid: number }>('instance-started', (event) => {
+      setRunningInstances((prev) => Array.from(new Set([...prev, event.payload.instanceId])));
+      showToast(`${event.payload.instanceName} is now running (PID: ${event.payload.pid})`);
+    });
+
+    const unlistenStopped = listen<{
+      instanceId: string;
+      instanceName: string;
+      exitCode: number;
+      isCrash: boolean;
+      crashReport?: string;
+    }>('instance-stopped', async (event) => {
+      setRunningInstances((prev) => prev.filter((id) => id !== event.payload.instanceId));
+      if (event.payload.isCrash) {
+        const fullLogs = event.payload.crashReport || (await invoke<string>('get_instance_logs', { instanceId: event.payload.instanceId }).catch(() => ''));
+        setLogModal({
+          open: true,
+          instanceName: event.payload.instanceName,
+          instanceId: event.payload.instanceId,
+          logs: fullLogs,
+          isCrash: true,
+          exitCode: event.payload.exitCode,
+        });
+        showToast(`${event.payload.instanceName} crashed (exit code ${event.payload.exitCode})`);
+      } else {
+        showToast(`${event.payload.instanceName} has closed`);
+      }
+    });
+
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
+      unlistenStarted.then((unlisten) => unlisten());
+      unlistenStopped.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -373,16 +426,46 @@ export function App() {
     }
   };
 
-  const handleLaunchInstance = async (id: string, _name: string) => {
+  const handleLaunchInstance = async (id: string, name: string) => {
+    if (runningInstances.includes(id)) {
+      showToast(`${name} is already running!`);
+      return;
+    }
     setLaunchingInstanceId(id);
     try {
       const res = await invoke<string>('launch_instance', { instanceId: id });
       showToast(res);
+      setRunningInstances((prev) => Array.from(new Set([...prev, id])));
     } catch (err) {
       showToast(`Launch error: ${err}`);
       setInstallProgress(null);
     } finally {
       setLaunchingInstanceId(null);
+    }
+  };
+
+  const handleOpenInstanceLogs = async (id: string, name: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    try {
+      const logs = await invoke<string>('get_instance_logs', { instanceId: id });
+      setLogModal({
+        open: true,
+        instanceName: name,
+        instanceId: id,
+        logs: logs || 'No logs captured yet.',
+        isCrash: false,
+      });
+    } catch (err) {
+      showToast(`Could not read logs: ${err}`);
+    }
+  };
+
+  const handleOpenInstanceDirectory = async (id: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    try {
+      await invoke('open_instance_directory', { instanceId: id });
+    } catch (err) {
+      showToast(`Could not open directory: ${err}`);
     }
   };
 
@@ -989,9 +1072,17 @@ export function App() {
                           )}
 
                           <div className="flex items-start justify-between z-10">
-                            <h2 className={`text-xl font-bold tracking-tight leading-snug drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] ${hasBanner ? 'text-white' : contrastTextColor}`}>
-                              {inst.name}
-                            </h2>
+                            <div>
+                              <h2 className={`text-xl font-bold tracking-tight leading-snug drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] ${hasBanner ? 'text-white' : contrastTextColor}`}>
+                                {inst.name}
+                              </h2>
+                              {runningInstances.includes(inst.id) && (
+                                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 mt-1 backdrop-blur-md shadow-sm">
+                                  <span className="size-1.5 rounded-full bg-emerald-400 animate-ping" />
+                                  <span>RUNNING</span>
+                                </div>
+                              )}
+                            </div>
 
                             {overrideAccount && (
                               <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-black/40 text-white backdrop-blur-md border border-white/20 shadow-md">
@@ -1009,8 +1100,30 @@ export function App() {
                           <div className="absolute inset-0 bg-radial from-white/[0.02] to-transparent pointer-events-none" />
 
                           {/* Bottom area: Clean and simple (just name when unhovered); shows rounded icon buttons on hover */}
-                          <div className="flex items-end justify-end z-10 min-h-[36px]">
+                          <div className="flex items-end justify-between z-10 min-h-[36px]">
+                            <div>
+                              {runningInstances.includes(inst.id) && (
+                                <button
+                                  type="button"
+                                  title="View Game Output / Logs"
+                                  onClick={(e) => handleOpenInstanceLogs(inst.id, inst.name, e)}
+                                  className="px-3 py-1.5 rounded-full border border-white/20 bg-black/50 hover:bg-black/70 text-white/90 hover:text-white text-xs font-medium flex items-center gap-1.5 backdrop-blur-md transition-all shadow-md active:scale-95 cursor-pointer"
+                                >
+                                  <FileText className="size-3.5 text-emerald-400" />
+                                  <span>Logs</span>
+                                </button>
+                              )}
+                            </div>
+
                             <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                              <button
+                                title="Open Instance Directory"
+                                onClick={(e) => handleOpenInstanceDirectory(inst.id, e)}
+                                className="size-9 rounded-full border border-white/20 bg-black/40 hover:bg-black/60 text-white flex items-center justify-center transition-all cursor-pointer backdrop-blur-md active:scale-95 shadow-md"
+                              >
+                                <FolderOpen className="size-4" />
+                              </button>
+
                               <button
                                 title="Share Instance"
                                 onClick={(e) => handleShareInstance(inst, e)}
@@ -1083,18 +1196,61 @@ export function App() {
                 </button>
               </div>
 
-              <button
-                disabled={launchingInstanceId === selectedInstance.id}
-                onClick={() => handleLaunchInstance(selectedInstance.id, selectedInstance.name)}
-                className={`w-full py-3 text-xs font-semibold rounded-2xl transition-all flex items-center justify-center gap-2 shadow-lg active:scale-98 cursor-pointer ${
-                  launchingInstanceId === selectedInstance.id
-                    ? 'bg-neutral-700 text-white animate-pulse'
-                    : 'bg-white text-black hover:bg-neutral-200'
-                }`}
-              >
-                <Play className="size-4 fill-current" />
-                <span>{launchingInstanceId === selectedInstance.id ? 'LAUNCHING...' : 'PLAY NOW'}</span>
-              </button>
+              <div className="space-y-2">
+                <button
+                  disabled={launchingInstanceId === selectedInstance.id}
+                  onClick={() => handleLaunchInstance(selectedInstance.id, selectedInstance.name)}
+                  className={`w-full py-3 text-xs font-semibold rounded-2xl transition-all flex items-center justify-center gap-2 shadow-lg active:scale-98 cursor-pointer ${
+                    launchingInstanceId === selectedInstance.id
+                      ? 'bg-neutral-700 text-white animate-pulse'
+                      : runningInstances.includes(selectedInstance.id)
+                      ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/25'
+                      : 'bg-white text-black hover:bg-neutral-200'
+                  }`}
+                >
+                  {runningInstances.includes(selectedInstance.id) ? (
+                    <>
+                      <span className="size-2 rounded-full bg-emerald-400 animate-ping mr-0.5" />
+                      <span>GAME RUNNING</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="size-4 fill-current" />
+                      <span>{launchingInstanceId === selectedInstance.id ? 'LAUNCHING...' : 'PLAY NOW'}</span>
+                    </>
+                  )}
+                </button>
+
+                {/* Quick Action Toolbar: Open Directory, Logs, Settings */}
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    onClick={() => handleOpenInstanceDirectory(selectedInstance.id)}
+                    className="py-2 px-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-white/70 hover:text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-all border border-white/[0.06] cursor-pointer"
+                    title="Open Directory in File Explorer"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    <span>Folder</span>
+                  </button>
+
+                  <button
+                    onClick={(e) => handleOpenInstanceLogs(selectedInstance.id, selectedInstance.name, e)}
+                    className="py-2 px-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-white/70 hover:text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-all border border-white/[0.06] cursor-pointer"
+                    title="View Instance Logs and Output"
+                  >
+                    <FileText className="size-3.5" />
+                    <span>Logs</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowAdvancedModal({ open: true, instance: selectedInstance })}
+                    className="py-2 px-2.5 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-white/70 hover:text-white text-xs font-medium flex items-center justify-center gap-1.5 transition-all border border-white/[0.06] cursor-pointer"
+                    title="Advanced Settings and Mods"
+                  >
+                    <Settings className="size-3.5" />
+                    <span>Config</span>
+                  </button>
+                </div>
+              </div>
 
               <div className="p-4 rounded-2xl bg-white/[0.03] border border-white/[0.06] space-y-3">
                 <div className="flex items-center justify-between">
@@ -1732,7 +1888,7 @@ export function App() {
 
       {/* Share Manifest Modal */}
       {showShareModal.open && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-xl flex items-center justify-center z-50 p-4">
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xl flex items-center justify-center z-60 p-4">
           <div className="bg-[#111111] border border-white/10 rounded-3xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-semibold text-white">Share Instance</h3>
@@ -2158,6 +2314,96 @@ export function App() {
           </div>
         </div>
       )}
+      {/* Log & Crash Output Modal */}
+      {logModal.open && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-xl flex items-center justify-center z-80 p-4 animate-in fade-in zoom-in-95 duration-100">
+          <div className="bg-[#111111] border border-white/10 rounded-3xl max-w-3xl w-full flex flex-col max-h-[85vh] shadow-2xl overflow-hidden">
+            <div className="p-5 border-b border-white/[0.07] flex items-center justify-between shrink-0 bg-[#0C0C0C]">
+              <div className="flex items-center gap-3">
+                <div className={`size-9 rounded-2xl flex items-center justify-center ${
+                  logModal.isCrash ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' : 'bg-white/[0.05] text-white/70'
+                }`}>
+                  {logModal.isCrash ? <AlertTriangle className="size-4" /> : <FileText className="size-4" />}
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                    <span>{logModal.isCrash ? 'Game Crashed' : 'Game Logs'}</span>
+                    <span className="text-xs text-white/40 font-normal">• {logModal.instanceName}</span>
+                  </h3>
+                  <p className="text-[11px] text-white/40">
+                    {logModal.isCrash
+                      ? `Minecraft terminated unexpectedly (Exit code: ${logModal.exitCode ?? -1})`
+                      : 'Live capture of game stdout, stderr, and system logs.'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  title="Refresh logs from disk"
+                  onClick={async () => {
+                    const l = await invoke<string>('get_instance_logs', { instanceId: logModal.instanceId }).catch(() => '');
+                    setLogModal((prev) => ({ ...prev, logs: l }));
+                    showToast('Logs refreshed.');
+                  }}
+                  className="size-8 rounded-full bg-white/[0.04] hover:bg-white/10 text-white/50 hover:text-white flex items-center justify-center transition-all cursor-pointer"
+                >
+                  <RotateCcw className="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLogModal((prev) => ({ ...prev, open: false }))}
+                  className="size-8 rounded-full bg-white/[0.04] hover:bg-white/10 text-white/50 hover:text-white flex items-center justify-center transition-all cursor-pointer"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Terminal / Log Output Area */}
+            <div className="flex-1 p-5 overflow-y-auto bg-black/60 font-mono text-[11px] leading-relaxed text-neutral-300 selection:bg-white/20 select-text space-y-1">
+              <pre className="whitespace-pre-wrap break-all font-mono">
+                {logModal.logs || 'No log output available.'}
+              </pre>
+            </div>
+
+            {/* Footer */}
+            <div className="p-4 border-t border-white/[0.07] bg-[#0C0C0C] flex items-center justify-between shrink-0">
+              <button
+                type="button"
+                onClick={() => handleOpenInstanceDirectory(logModal.instanceId)}
+                className="px-3.5 py-1.5 rounded-xl bg-white/[0.05] hover:bg-white/15 text-white/70 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+              >
+                <FolderOpen className="size-3.5" />
+                <span>Open Game Folder</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(logModal.logs);
+                    showToast('Logs copied to clipboard!');
+                  }}
+                  className="px-4 py-1.5 rounded-xl bg-white/[0.06] hover:bg-white/15 text-white/80 hover:text-white text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+                >
+                  <Copy className="size-3.5" />
+                  <span>Copy Logs</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLogModal((prev) => ({ ...prev, open: false }))}
+                  className="px-5 py-1.5 rounded-xl bg-white text-black text-xs font-semibold hover:bg-neutral-200 transition-all cursor-pointer shadow-sm"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Advanced Instance Configuration & Mods Modal */}
       <AdvancedInstanceModal
         isOpen={showAdvancedModal.open}
